@@ -1,9 +1,9 @@
-name: 
+name: check_cache 
 description: "file:///README.md"
 url: "https://www.netways.org/projects/plugins"
 tags: ~
-vendor: Netways
-target: Temperature
+vendor: NETWAYS
+target: Process, Service
 type: Plugin
 license: gplv2
 releases: 
@@ -12,8 +12,8 @@ releases:
     description: "1.0 Release"
     files: 
       - 
-        name: check_cache.pl
-        url: "file:///check_cache.pl"
+        name: check_cache
+        url: "file:///check_cache"
         description: none
-        checksum: 
+        checksum: fcb00edaf694ddc9ee09a48c3c4a82f2
 
