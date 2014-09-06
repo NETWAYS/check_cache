@@ -1,0 +1,729 @@
+#!/usr/bin/perl -w
+
+# use nagios embedded perl
+# nagios: -epn
+
+# COPYRIGHT:
+#
+# This software is Copyright (c) 2008 - 2013 NETWAYS GmbH, Tobias Redel
+#                                <support@netways.de>
+#
+#
+# (Except where explicitly superseded by other copyright notices)
+#
+#
+# LICENSE:
+#
+# This work is made available to you under the terms of Version 2 of
+# the GNU General Public License. A copy of that license should have
+# been provided with this software, but in any event can be snarfed
+# from http://www.fsf.org.
+#
+# This work is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301 or visit their web page on the internet at
+# http://www.fsf.org.
+#
+#
+# CONTRIBUTION SUBMISSION POLICY:
+#
+# (The following paragraph is not intended to limit the rights granted
+# to you to modify and distribute this software under the terms of
+# the GNU General Public License and is only of importance to you if
+# you choose to contribute your changes and enhancements to the
+# community by submitting them to NETWAYS GmbH.)
+#
+# By intentionally submitting any modifications, corrections or
+# derivatives to this work, or any other work intended for use with
+# this Software, to NETWAYS GmbH, you confirm that
+# you are the copyright holder for those contributions and you grant
+# NETWAYS GmbH a nonexclusive, worldwide, irrevocable,
+# royalty-free, perpetual, license to use, copy, create derivative
+# works based on those contributions, and sublicense and distribute
+# those contributions and any derivatives thereof.
+#
+# Nagios and the Nagios logo are registered trademarks of Ethan Galstad.
+
+=head1 NAME
+
+check_cache - A Icinga/Nagios Plugin wrapper with caching function
+
+=head1 SYNOPSIS
+
+check_cache -H <hostname>
+            -C <command>
+            -S <servicename>
+            -p <period>
+            [-m] <mode>
+            [-e] <executor>
+            [-u] <username>
+            [-t] <tmpdir>
+            [-c] <configfile>
+            [-v] [<path to logfile>]
+            [-h]
+            [-V]
+            [--print-sample-config]
+
+A Icinga/Nagios Plugin wrapper with caching function
+
+=head1 OPTIONS
+
+=over 
+
+=item -H|--host <hostname>
+
+IP address or DNS name of target host
+
+=item -C|--command <command>
+
+Nagios Plugin (command), (example: -C '/usr/local/nagios/libexec/check_users -w 2 -c 3')
+
+=item -S|--service <servicename>
+
+Service Name (example: -S 'check_users' )
+
+=item -p|--period <period>
+
+Caching Period in minutes (example: -p 5)
+
+=item -m|--mode <mode>
+
+Caching mode, dynamic or static? (example: -m static). If not defined, mode will be dynamic
+
+=item -e|--execute <executor>
+
+Path to 'remote executor' (example: -e /usr/local/nagios/libexec/check_by_ssh). If not defined, executor path will be /usr/local/nagios/libexec/check_by_ssh
+It is possible to add a list of executor-plugin specific arguments
+
+=item -o|--options <argument list>
+
+List of arguments for the 'remote executor'
+
+=item -d|--hashdump
+
+Load the cache and generate a perl hash dump. Hostt and service option is also needed.
+
+=item -u|--username <username>
+
+Login on remote host with user <username>
+
+=item -t|--tmpdir <tmpdir>
+
+Path to temporary caching dir. If not defined, dir will be /tmp
+
+=item -c|--config <configfile>
+
+Path to config file
+
+=item -v|--verbose <path to logfile>
+
+Verbose mode. If no logfile is specified, verbose output will be printend to STDOUT
+
+=item -h|--help
+
+print help page
+
+=item -V|--version
+
+print plugin version
+
+=item --print-sample-config
+
+print sample configuration file
+
+=cut
+
+use strict;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Pod::Usage;
+use XML::Simple;
+use Data::Dumper;
+use Fcntl ':flock';
+
+# starting with XML::Parser 1.08 it will default to XML::SAX as parser, if installed.
+# that throws errors with DefaultParser.ini and XML::Namespace dependencies and
+# is even slower than the XML::Parser library, which is why we set it to that again.
+# http://search.cpan.org/~grantm/XML-Simple-2.20/lib/XML/Simple.pm#ENVIRONMENT
+$ENV{XML_SIMPLE_PREFERRED_PARSER}="XML::Parser";
+
+# version string
+my $version = '0.9.4';
+
+# define states
+our @state = ('OK', 'WARNING', 'CRITICAL', 'UNKNOWN');
+
+# get command-line parameters
+my ($hostname, $command, $service, $period, $mode, $execute, $username, $tmpdir, $configfile, $verbose, $help);
+my ($showVersion, $print_sample_config, @options, $hashdump);
+
+GetOptions(
+        "H|host=s"	=> \$hostname,
+        "C|command=s"	=> \$command,
+        "S|service=s"	=> \$service,
+        "p|period=s"	=> \$period,
+        "m|mode=s"	=> \$mode,
+        "e|execute=s"	=> \$execute,
+        "u|username=s"  => \$username,
+        "t|tmpdir=s"	=> \$tmpdir,
+        "c|config=s"	=> \$configfile,
+        "v|verbose:s"	=> \$verbose,
+        "h|help"	=> \$help,
+	"o|options=s"	=> \@options,
+        "V|version"	=> \$showVersion,
+	"d|hashdump"	=> \$hashdump,
+        "print-sample-config" => \$print_sample_config
+);
+
+
+
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
+# help and version page and sample config...
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
+
+# should print version?
+if (defined $showVersion) { print $version."\n"; exit 0; }
+
+# should print sample config?
+print_sample_config() if defined $print_sample_config;
+
+# should print help?
+if ( $help || !$command || !$service || !$period || !$hostname ) {
+	# There is a bug in Pod::Usage < 1.36 (Perl < v5.10.1)- it can only parse the script if verbose mode is >= 2;
+	# but in this verbose level the help is shown as a manpage
+	if ( $] >= 5.010001 ) {
+		pod2usage(1);
+	} else {
+		pod2usage({ -exitval => 1, -verbose => 2, });
+	}
+}
+
+
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
+# let's go!
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
+
+# first of all - process config file
+my $CONFIG;
+my $options;
+if (defined $configfile) { read_config($configfile); foreach(keys %{$CONFIG}) { eval "\$$_=\$CONFIG->{\$_};"; beVerbose("CONFIGFILE", "Set \$$_ to '$CONFIG->{$_}'"); } }
+
+# auto complement
+$mode    = "dynamic" if !defined $mode;
+$tmpdir  = "/tmp" if !defined $tmpdir;
+$execute = "/usr/local/nagios/libexec/check_by_ssh" if (! defined $execute);
+@options = () if (scalar @options < 1);
+
+# define variables
+my $cache;
+my $cache2;
+my $cache_file_path = $tmpdir."/".$hostname.".cache";
+my $check_queue;
+my $return_item;
+my $calc;
+my %FILELOCK_HANDLES;
+
+# check executable (allow additional arguments)
+$execute =~ /^(\S+)/;
+if (! -f "$1" && ! $hashdump) { LeavePlugin("1", "can't find executable '$execute'"); }
+
+# save value for plugin exit
+$return_item = $service;
+
+# is cache file available?
+if (! -f $cache_file_path) {
+        # not available => create
+        open(FILE,">$cache_file_path") || die LeavePlugin("3", "Can't create cache file: $!");
+        close(FILE);
+        beVerbose("FILE CREATE", $cache_file_path);
+}
+
+# calc period, if $period is a macro
+if (defined($period) && $period >= 1000000000) {
+	$period = sprintf ("%.0f", (time()-$period)/60);
+}
+
+# set lock level 1 (period lock)
+fileLock('1', 'lock', $period);
+
+# read xml cache file if not empty
+beVerbose("XML CACHE", "read cache file");
+if (-s $cache_file_path >= 3) {
+        $cache = XMLin($cache_file_path, keyattr => { service => 'name' }, forcearray => ['service']);
+}
+
+# generate dump
+if ( $hashdump ) {
+	unless ($cache) {
+		print "No cached data.\n";
+		exit 1;
+	}
+	print Dumper($cache);
+	exit 0;
+}
+
+# decode whole xml stuff
+formatCacheResults("decode");
+
+# command already cached?
+if (!defined $cache->{'service'}->{$service}) {
+        # not found in cache file...
+        # so... add ourselves to queue
+        add2Queue($service, $command, $period, '');
+
+        # search all related services => mode? (static/dynamic)
+        searchRelatedObjects($service, $mode);
+
+        # execute
+        executeCommand();
+
+        # save in cache file
+        writeCacheFile();
+} else {
+        # found in cache file...
+        # so... calc validity
+        $calc = calcValidity($cache->{'service'}->{$service}->{'executiontime'});
+
+        # execute stuff if cache entry is not valid any more or command has changed
+        if (($calc >= $cache->{'service'}->{$service}->{'period'}) || $command ne $cache->{'service'}->{$service}->{'command'}) {
+        	add2Queue($service, $command, $period, '');
+        	searchRelatedObjects($service, $mode);
+	        executeCommand();
+	        writeCacheFile();
+        } else {
+                # otherwise, check if returncode of cache entry == 0
+		if (!defined $cache->{'service'}->{$service}->{'returncode'} || $cache->{'service'}->{$service}->{'returncode'} != 0) {
+			$cache->{'service'}->{$service}->{'returncode'} = '3' if !defined $cache->{'service'}->{$service}->{'returncode'};
+                        add2Queue($service, $command, $period, $cache->{'service'}->{$service}->{'returncode'});
+                        searchRelatedObjects($service, $mode);
+                        searchOnlyWarningsAndErrors();
+                        executeCommand();
+                        writeCacheFile();
+                }
+        }
+}
+
+# unlock lock level 1 (period lock)
+fileLock('1', 'unlock', $period);
+
+# return and leave
+LeavePlugin($return_item);
+
+
+
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
+# functions...
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
+
+sub print_sample_config {
+        print "\n";
+        print "# --------------------------------------------------\n";
+        print "# check_cache sample configfile\n";
+        print "# --------------------------------------------------\n";
+        print "\n";
+        print "# Caching mode, dynamic or static? (example: -m static). If not defined, mode will be dynamic\n";
+        print "# mode     = dynamic\n";
+        print "\n";
+        print "# Login on remote host with user <username>\n";
+        print "# username = nagios\n";
+        print "\n";
+        print "# Path to temporary caching dir. If not defined, dir will be /tmp\n";
+        print "# tmpdir   = /tmp\n";
+        print "\n";
+        print "# Path to 'remote executor' - If not defined, executor path will be /usr/local/nagios/libexec/check_by_ssh\n";
+        print "# execute  = /usr/local/nagios/libexec/check_by_ssh\n";
+	print "\n";
+        print "# List of arguments for the remote executor\n";
+        print "# options  = -q -E\n";
+        print "\n";
+
+        exit 0;
+}
+
+sub beVerbose {
+        my $type = shift;
+        my $text = shift;
+
+        if (defined $verbose) {
+                # generate message
+                my $message = localtime(time)." | Verbose: $type: $text\n";
+
+                # should write log to file or STDOUT?
+                if ($verbose ne "") {
+                        open(LOGF,">>$verbose") || die $!;
+                        print LOGF $message;
+                        close(LOGF);
+                } else {
+                        print $message;
+                }
+        }
+}
+
+
+sub LeavePlugin {
+        formatCacheResults("decode");
+
+        if (!$_[1]) {
+		if ($cache->{'service'}->{$_[0]}->{'lastresult'} && defined $cache->{'service'}->{$_[0]}->{'returncode'}) {
+			print $cache->{'service'}->{$_[0]}->{'lastresult'}."\n";
+                	exit $cache->{'service'}->{$_[0]}->{'returncode'};
+		} else {
+                	# no previous result/returncode found
+			print "UNKNOWN\n";
+			exit 3;
+		}
+        } else {
+                my $exitCode = $_[0];
+                my $comment  = $_[1];
+
+                print $state[$exitCode]." - $comment\n";
+                exit $exitCode;
+        }
+}
+
+
+sub read_config {
+        my $configfile = shift;
+        my $config;
+
+        # read configfile
+        open(CF,'<'.$configfile) or die "Can't open configfile: $!";
+         read(CF, $config, -s $configfile);
+        close(CF);
+        beVerbose("CONFIGFILE", "read $configfile");
+
+        # split lines
+        my @lines  = split(/\015\012|\012|\015/,$config);
+        foreach(@lines) {
+                next if($_ =~ /^\s*#/);
+                next if($_ !~ /^\s*\S+\s*=.*$/);
+
+                my ($key,$value) = split(/=/,$_,2);
+
+                # Remove whitespaces at the beginning and at the end
+                    $key   =~ s/^\s+//g;
+                $key   =~ s/\s+$//g;
+                $value =~ s/^\s+//g;
+                $value =~ s/\s+$//g;
+
+                beVerbose("CONFIGFILE", "Found entry '$key' with value '$value'");
+                $CONFIG->{$key} = $value;
+        }
+
+}
+
+
+sub formatCacheResults {
+        my $type = shift;
+        my @cache = shift;
+
+        foreach(keys %{$cache->{'service'}}) {
+                if ($type eq "encode" || $type eq "ENCODE") {
+			if ($cache->{'service'}->{$_}->{'lastresult'}) {
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/\n/\\n/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/</__lt/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/>/__gt/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/"/__quote/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/\$/__dollar/g;
+				# remove control character
+				$cache->{'service'}->{$_}->{'lastresult'} =~s///g;
+                #$cache->{'service'}->{$_}->{'lastresult'} =~s/\^\[//g;
+			}
+
+			$cache->{'service'}->{$_}->{'command'} =~s/\n/\\n/g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/</__lt/g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/>/__gt/g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/"/__quote/g;
+			$cache->{'service'}->{$_}->{'command'} =~s/\$/__dollar/g
+		}
+
+                if ($type eq "decode" || $type eq "DECODE") {
+			if ($cache->{'service'}->{$_}->{'lastresult'}) {
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/\\n/\n/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/__lt/</g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/__gt/>/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/__quote/"/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/__dollar/\$/g;
+				$cache->{'service'}->{$_}->{'lastresult'} =~s/^[\n]*//;
+			}
+
+			$cache->{'service'}->{$_}->{'command'} =~s/\\n/\n/g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/__lt/</g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/__gt/>/g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/__quote/"/g;
+			$cache->{'service'}->{$_}->{'command'} =~s/__dollar/\$/g;
+                        $cache->{'service'}->{$_}->{'command'} =~s/^[\n]*//;
+		}
+        }
+}
+
+
+sub calcValidity {
+        my $value     = shift;
+        my $timestamp = time();
+        my $calc;
+
+        $calc = $timestamp - $value;
+        $calc = $calc/60;
+
+        return $calc;
+}
+        
+
+sub createCacheObject {
+        my $hostname  = shift;
+        my $timestamp = localtime(time);
+
+        $cache->{'hostname'} = $hostname;
+        $cache->{'created'}  = $timestamp;
+}
+
+
+sub add2Queue {
+        my $service_name = shift;
+        my $command      = shift;
+        my $period       = shift;
+        my $returncode   = shift;
+
+        $check_queue->{$service_name}->{'command'}  = $command;
+        $check_queue->{$service_name}->{'period'}   = $period;
+        $check_queue->{$service_name}->{'returncode'} = $returncode;
+        $check_queue->{$service_name}->{'result'}   = defined;
+
+        beVerbose("CMD QUEUE", "added : ".$command);
+}
+
+
+sub searchRelatedObjects {
+        my $service_name = shift;
+        my $mode 	 = shift;
+        my $timestamp    = time();
+
+        foreach(keys %{$cache->{'service'}}) {
+                # Don't include ourselves again
+                next if ($_ eq $service_name);
+
+                # dynamic mode...
+                # (search criteria)
+                #
+                # 1) get all services listen in cache file
+                # 2) build a subset of all services minor or equal '$period'
+                # 3) build a subset of subset 2 where service's cache entry is not valid any more
+                if ($mode eq "dynamic") {
+                        # calculate validity of each service
+                        $calc = calcValidity($cache->{'service'}->{$_}->{'executiontime'});
+
+                        # if service has the same or a lower validity AND is not valid any more
+                        if ($cache->{'service'}->{$_}->{'period'} <= $period && $calc >= $cache->{'service'}->{$_}->{'period'}) {
+                                beVerbose("CMD QUEUE", " - - - following item is related - - - ");
+                                add2Queue($_, $cache->{'service'}->{$_}->{'command'}, $cache->{'service'}->{$_}->{'period'}, $cache->{'service'}->{$_}->{'returncode'});
+                        }
+                }
+
+                # static mode...
+                # (search criteria)
+                #
+                # 1) get all services listen in cache file
+                # 2) get a subset of all services equal to '$period'
+                if ($mode eq "static") {
+                        beVerbose("CMD QUEUE", " - - - following item is related - - -");
+                        add2Queue($_, $cache->{'service'}->{$_}->{'command'}, $cache->{'service'}->{$_}->{'period'}, $cache->{'service'}->{$_}->{'returncode'}) if $cache->{'service'}->{$_}->{'period'} == $period;
+                }
+        }
+}
+
+
+sub searchOnlyWarningsAndErrors {
+        foreach(keys %{$check_queue}) {
+                if ($check_queue->{$_}->{'returncode'} == 0) {
+                        delete $check_queue->{$_};
+                        beVerbose("CMD QUEUE", "deleted: $_");
+                }
+        }
+}
+
+
+sub fileLock {
+        my $level  = shift;
+        my $type   = shift;
+        my $period = shift;
+        my $lock_path;
+
+        # set file
+        $lock_path = $cache_file_path.".".$period if $level == 1;
+        $lock_path = $cache_file_path if $level == 2;
+
+        # lock mode
+        if ($type eq "lock" || $type eq "LOCK") {
+                open my $FH, '>', $lock_path;
+                flock($FH, LOCK_EX);
+                beVerbose("FILE LOCK", $lock_path);
+                $FILELOCK_HANDLES{$lock_path} = $FH;
+        }
+
+        # unlock mode
+        if ($type eq "unlock" || $type eq "UNLOCK") {
+                flock($FILELOCK_HANDLES{$lock_path}, LOCK_UN);
+                beVerbose("FILE UNLOCK", $lock_path);
+                close $FILELOCK_HANDLES{$lock_path};
+        }
+}
+
+
+sub writeCacheFile {
+        formatCacheResults("encode");
+
+        # adjust $cache (delete empty vars)
+        foreach(keys %{$cache->{'service'}}) {
+                foreach my $val (keys %{$cache->{'service'}->{$_}}) {
+                        delete $cache->{'service'}->{$_}->{$val} if !defined $cache->{'service'}->{$_}->{$val};
+                }
+        }
+        
+        # generate XML
+        my $xml = XMLout($cache, RootName => 'cachefile');
+
+        # open file and save
+        fileLock('2', 'lock');
+        open(FILE,">$cache_file_path") || die $!;
+	binmode(FILE, ":utf8");
+        print FILE $xml;
+        beVerbose("XML CACHE", "write cache file");
+        close(FILE);
+        fileLock('2', 'unlock');
+}
+
+
+sub executeCommand {
+        # add 'executor' to cmd var
+        my $cmd = $execute;
+        # add username to cmd var (if needed)
+        $cmd .= " -l ".$username if defined $username;
+        # add hostname to cmd var
+        $cmd .= " -H ".$hostname;
+	# add timeout
+	$cmd .= " -t 300";
+	# add quite mode for check_by_ssh
+	#$cmd .= " -q" if ($execute =~ /check_by_ssh/);
+	# ignore STDERR for check_by_ssh
+	#$cmd .= " -E" if ($execute =~ /check_by_ssh/);
+	# append all options
+	if (defined ($options) ) {
+		$cmd .= " $options";
+	}
+	else {
+		foreach (@options) {
+			$cmd .= " $_";
+		}
+	}
+
+        my @cached_services;
+
+        # build -C Options
+        foreach(keys %{$check_queue}) {
+                push(@cached_services, $_);
+                my $quoted_cmd = $check_queue->{$_}->{'command'};
+                $quoted_cmd =~ s/'/'"'"'/g;
+                $cmd .= " -C '".$quoted_cmd."'";
+        }
+
+        # execute...
+        beVerbose("CMD EXEC", $cmd);
+        my $result = qx($cmd);
+	my $result_code = $?;
+
+        # format return codes...
+        if ($result_code == 256) { $result_code = 1; }
+        if ($result_code == 512) { $result_code = 2; }
+	if ($result_code == 768) { $result_code = 3; }
+	if ($result_code != 0 && $result_code != 1 && $result_code != 2 && $result_code != 3) {
+		$result_code = 3;
+	}
+
+
+        # one or more executed commands?
+        if ((scalar @cached_services) == 1) {
+                chomp($result);
+
+		# workaround for check_by_ssh with option -E and -q
+		my $workaround;
+                if ( $cmd =~ / -[E|q]/ ) {
+                        $workaround = grep /^UNKNOWN - check_by_ssh: Remote command .* returned status 255$/, $result;
+                }
+	
+
+                # set up $cache for writin
+                createCacheObject($hostname);
+                $cache->{'service'}->{$cached_services[0]}->{'name'} = $cached_services[0];
+                $cache->{'service'}->{$cached_services[0]}->{'command'} = $check_queue->{$cached_services[0]}->{'command'};
+                $cache->{'service'}->{$cached_services[0]}->{'period'} = $check_queue->{$cached_services[0]}->{'period'};
+                $cache->{'service'}->{$cached_services[0]}->{'executiontime'} = time();
+                $cache->{'service'}->{$cached_services[0]}->{'executiontimehr'} = localtime(time);
+		if ( $workaround) {
+                	$cache->{'service'}->{$cached_services[0]}->{'lastresult'} = 'UNKNOWN: Probably SSH-Login error';
+			
+		} else {
+                	$cache->{'service'}->{$cached_services[0]}->{'lastresult'} = $result;
+                }
+		$cache->{'service'}->{$cached_services[0]}->{'returncode'} = $result_code;
+        } else {
+                createCacheObject($hostname);
+                my ($message_to_add, @results_messages, @results_codes);
+		# fix 'output without \n' problem
+		$result =~ s/STATUS CODE/\nSTATUS CODE/g;
+                # split return values and sort messages in @results_messages and return codes in @results_codes;
+                my @results = split(/\n/, $result);
+
+		# ssh failure (e.g. login, ...) - only one result is present, but we need it for all services
+		# the STATUS CODE is not set correctly
+		my $statusCounter = grep /STATUS CODE: [0-3]/, @results;
+
+		# workaround for check_by_ssh with option -E and -q
+		my $workaround;
+		if ( $cmd =~ / -[E|q]/ ) {
+			$workaround = grep /STATUS CODE: \$?/, @results;
+		}
+
+		# handle ssh errors
+		if ( ! $statusCounter || scalar @cached_services > $statusCounter ) {
+			my $tmpResult = $results[0];
+			@results = ();
+			for ( my $i = 0; $i < scalar @cached_services; $i++) {
+				if ( $workaround) {
+					push @results, 'UNKNOWN: Probably SSH-Login error';
+				} else {
+					push @results, $tmpResult;
+				}
+				push @results, "STATUS CODE: $result_code";
+			}
+		}
+
+                foreach(@results) {
+                        if ($_ =~ /^STATUS CODE(.*)[0-9]/) {
+                                chomp($message_to_add); push(@results_messages, $message_to_add); $message_to_add = "";
+                                $message_to_add .= $_;  push(@results_codes, $message_to_add);    $message_to_add = "";
+                        } else {
+                                $message_to_add .= $_."\n";
+                        }
+                }
+
+                for (my $i=0; $i < (scalar @cached_services); $i++) {
+                        # split again for return code :(
+                        my $return_code = (split(/ /, $results_codes[$i]))[2];
+
+                        $cache->{'service'}->{$cached_services[$i]}->{'name'} = $cached_services[$i];
+                        $cache->{'service'}->{$cached_services[$i]}->{'command'} = $check_queue->{$cached_services[$i]}->{'command'};
+                        $cache->{'service'}->{$cached_services[$i]}->{'period'} = $check_queue->{$cached_services[$i]}->{'period'};
+                        $cache->{'service'}->{$cached_services[$i]}->{'executiontime'} = time();
+                        $cache->{'service'}->{$cached_services[$i]}->{'executiontimehr'} = localtime(time);
+			$results_messages[$i] =~ s/\n$//;
+                        $cache->{'service'}->{$cached_services[$i]}->{'lastresult'} = $results_messages[$i];
+                        $cache->{'service'}->{$cached_services[$i]}->{'returncode'} = $return_code;
+                }
+        }
+}
